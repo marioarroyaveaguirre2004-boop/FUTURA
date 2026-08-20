@@ -2,19 +2,22 @@
 Futura Work — Engineering Enrichment Tool
 Upload an Airscale/Clay CSV, get engineering hiring signal + tech stack enrichment back.
 
-Adds new columns without touching any existing columns:
-  - ats_source, open_engineering_jobs, engineering_job_titles
-  - github_languages (optional)
-  - tech_stack, engineer_types, seniority_mix, confidence, notes  (only if classification is on)
+Search order for open engineering jobs:
+  1. Greenhouse (free API)
+  2. Lever (free API)
+  3. Ashby (free API)
+  4. Careers page read by Claude (fallback, only runs when classification is enabled,
+     since it requires Claude to interpret unstructured text)
+
+Adds new columns without touching any existing columns.
 """
 
-import io
 import re
-import time
 import json
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 
 # ----------------------------------------------------------------------------
@@ -24,7 +27,10 @@ import streamlit as st
 st.set_page_config(page_title="Futura — Engineering Enrichment", page_icon="🛠️", layout="wide")
 
 REQUEST_TIMEOUT = 8
+PAGE_FETCH_TIMEOUT = 10
 CLAUDE_MODEL = "claude-sonnet-4-6"
+MAX_DESC_CHARS_PER_JOB = 700       # per-job description truncation fed to Claude
+MAX_PAGE_CHARS_FOR_FALLBACK = 6000  # careers-page text truncation fed to Claude
 
 ENGINEERING_KEYWORDS = [
     "engineer", "engineering", "developer", "dev ", "swe", "software",
@@ -35,12 +41,8 @@ ENGINEERING_KEYWORDS = [
     "security engineer", "cloud engineer", "systems engineer", "embedded",
 ]
 
-COMPANY_NAME_CANDIDATES = [
-    "company name", "company", "name", "organization", "org name", "account name",
-]
-DOMAIN_CANDIDATES = [
-    "company domain", "domain", "website", "company website", "url", "site",
-]
+COMPANY_NAME_CANDIDATES = ["company name", "company", "name", "organization", "org name", "account name"]
+DOMAIN_CANDIDATES = ["company domain", "domain", "website", "company website", "url", "site"]
 
 COMPANY_SUFFIXES = [
     "inc", "inc.", "llc", "ltd", "ltd.", "co", "co.", "corp", "corp.",
@@ -48,6 +50,30 @@ COMPANY_SUFFIXES = [
     "technologies", "technology", "tech", "labs", "biosciences", "biotech",
     "holdings", "group",
 ]
+
+CAREERS_PATH_CANDIDATES = [
+    "/careers", "/jobs", "/careers/", "/jobs/", "/join-us", "/about/careers",
+    "/company/careers", "/company/jobs", "/team/careers", "/en/careers",
+]
+
+WEBSITE_SIGNATURES = {
+    "React": ['id="root"', "data-reactroot", "react-dom"],
+    "Next.js": ["__next", "_next/static", 'name="next-head"'],
+    "Vue": ["data-v-", "__vue__", "vue.js"],
+    "Angular": ["ng-version", "ng-app"],
+    "WordPress": ["wp-content", "wp-includes"],
+    "Shopify": ["cdn.shopify.com", "shopify.com/s/"],
+    "Webflow": ["webflow.io", "data-wf-page", "data-wf-site"],
+    "Squarespace": ["squarespace.com", "static1.squarespace.com"],
+    "Wix": ["wix.com", "wixstatic.com"],
+    "HubSpot": ["hs-scripts.com", "hubspot.com/cs/"],
+    "Google Tag Manager": ["googletagmanager.com"],
+    "Cloudflare": ["cloudflare.com/cdn-cgi", "__cf_bm"],
+    "Vercel": ["vercel.app", "_vercel"],
+    "Netlify": ["netlify.app", "netlify.com"],
+    "Django": ["csrfmiddlewaretoken"],
+    "Ruby on Rails": ["csrf-param", "data-turbo"],
+}
 
 
 # ----------------------------------------------------------------------------
@@ -59,7 +85,6 @@ def guess_column(columns, candidates):
     for cand in candidates:
         if cand in lower_map:
             return lower_map[cand]
-    # fuzzy: contains
     for c in columns:
         cl = c.lower()
         if any(cand in cl for cand in candidates):
@@ -90,6 +115,16 @@ def domain_root(domain):
     return d if d else None
 
 
+def clean_domain(domain):
+    """Return a bare host, e.g. acme.com, suitable for building a URL."""
+    if not isinstance(domain, str) or not domain.strip():
+        return None
+    d = domain.strip().lower()
+    d = re.sub(r"^https?://", "", d)
+    d = d.split("/")[0]
+    return d if "." in d else None
+
+
 def name_slug_variants(name):
     if not isinstance(name, str) or not name.strip():
         return []
@@ -108,7 +143,6 @@ def candidate_slugs(company_name, domain):
         slugs.append(root)
     if company_name:
         slugs.extend(name_slug_variants(company_name))
-    # dedupe, preserve order
     seen = set()
     out = []
     for s in slugs:
@@ -119,63 +153,249 @@ def candidate_slugs(company_name, domain):
 
 
 # ----------------------------------------------------------------------------
-# ATS lookups (free, no auth)
+# Text helpers
+# ----------------------------------------------------------------------------
+
+def html_to_text(html, limit=None):
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] if limit else text
+
+
+def looks_remote(location_text, remote_flag=None):
+    if remote_flag is True:
+        return True
+    if remote_flag is False:
+        return False
+    if location_text and "remote" in location_text.lower():
+        return True
+    return None  # unknown
+
+
+# ----------------------------------------------------------------------------
+# ATS lookups (free, no auth) — return normalized job dicts
+# normalized job = {"title", "location", "remote" (True/False/None), "description"}
 # ----------------------------------------------------------------------------
 
 def try_greenhouse(slug):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     try:
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            jobs = data.get("jobs", [])
-            if isinstance(jobs, list):
-                return [j.get("title", "") for j in jobs]
-    except requests.RequestException:
-        pass
-    return None
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        jobs = data.get("jobs", [])
+        if not isinstance(jobs, list):
+            return None
+        out = []
+        for j in jobs:
+            loc = (j.get("location") or {}).get("name", "")
+            desc = html_to_text(j.get("content", ""), MAX_DESC_CHARS_PER_JOB)
+            out.append({
+                "title": j.get("title", ""),
+                "location": loc,
+                "remote": looks_remote(loc),
+                "description": desc,
+            })
+        return out
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def try_lever(slug):
     url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
     try:
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                return [j.get("text", "") for j in data]
-    except requests.RequestException:
-        pass
-    return None
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list):
+            return None
+        out = []
+        for j in data:
+            categories = j.get("categories", {}) or {}
+            loc = categories.get("location", "") or ""
+            workplace_type = j.get("workplaceType")  # "remote"/"hybrid"/"onsite" on newer Lever boards
+            remote_flag = True if workplace_type == "remote" else (False if workplace_type in ("hybrid", "onsite") else None)
+            desc = j.get("descriptionPlain") or html_to_text(j.get("description", ""), MAX_DESC_CHARS_PER_JOB)
+            out.append({
+                "title": j.get("text", ""),
+                "location": loc,
+                "remote": looks_remote(loc, remote_flag),
+                "description": (desc or "")[:MAX_DESC_CHARS_PER_JOB],
+            })
+        return out
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def try_ashby(slug):
     url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
     try:
         r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        jobs = data.get("jobs", [])
+        if not isinstance(jobs, list):
+            return None
+        out = []
+        for j in jobs:
+            loc = j.get("location", "") or ""
+            remote_flag = j.get("isRemote")
+            desc = html_to_text(j.get("descriptionHtml", ""), MAX_DESC_CHARS_PER_JOB)
+            out.append({
+                "title": j.get("title", ""),
+                "location": loc,
+                "remote": looks_remote(loc, remote_flag),
+                "description": desc,
+            })
+        return out
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def detect_ats_jobs(company_name, domain):
+    """Try every candidate slug against every ATS. Return (ats_name, [normalized jobs])."""
+    slugs = candidate_slugs(company_name, domain)
+    for slug in slugs:
+        for ats_name, fn in [("Greenhouse", try_greenhouse), ("Lever", try_lever), ("Ashby", try_ashby)]:
+            jobs = fn(slug)
+            if jobs is not None:
+                return ats_name, jobs
+    return None, []
+
+
+def filter_engineering(jobs):
+    return [j for j in jobs if any(kw in j["title"].lower() for kw in ENGINEERING_KEYWORDS)]
+
+
+def filter_remote(jobs, remote_only):
+    if not remote_only:
+        return jobs
+    return [j for j in jobs if j.get("remote") is True]
+
+
+# ----------------------------------------------------------------------------
+# Careers-page fallback (only used when ATS found nothing, and only when
+# Claude classification is enabled — reading unstructured HTML needs Claude)
+# ----------------------------------------------------------------------------
+
+def find_careers_url(domain):
+    host = clean_domain(domain)
+    if not host:
+        return None
+    for scheme in ("https://", "http://"):
+        homepage = f"{scheme}{host}"
+        try:
+            r = requests.get(homepage, timeout=PAGE_FETCH_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                text = (a.get_text() or "").lower()
+                if "career" in href.lower() or "career" in text or "jobs" in href.lower() or "jobs" in text:
+                    if href.startswith("http"):
+                        return href
+                    return homepage.rstrip("/") + "/" + href.lstrip("/")
+            # no link found on homepage — try common paths directly
+            for path in CAREERS_PATH_CANDIDATES:
+                candidate = homepage.rstrip("/") + path
+                try:
+                    rr = requests.get(candidate, timeout=PAGE_FETCH_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+                    if rr.status_code == 200:
+                        return candidate
+                except requests.RequestException:
+                    continue
+        except requests.RequestException:
+            continue
+    return None
+
+
+def fetch_page_text(url):
+    try:
+        r = requests.get(url, timeout=PAGE_FETCH_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
-            data = r.json()
-            jobs = data.get("jobs", [])
-            if isinstance(jobs, list):
-                return [j.get("title", "") for j in jobs]
+            return html_to_text(r.text, MAX_PAGE_CHARS_FOR_FALLBACK)
     except requests.RequestException:
         pass
     return None
 
 
-def detect_ats_jobs(company_name, domain):
-    """Try every candidate slug against every ATS. Return (ats_name, [job_titles]) or (None, [])."""
-    slugs = candidate_slugs(company_name, domain)
-    for slug in slugs:
-        for ats_name, fn in [("Greenhouse", try_greenhouse), ("Lever", try_lever), ("Ashby", try_ashby)]:
-            titles = fn(slug)
-            if titles is not None:
-                return ats_name, titles
-    return None, []
+def claude_extract_jobs_from_page(api_key, company_name, page_text):
+    """Ask Claude to pull engineering job listings out of raw careers-page text."""
+    prompt = f"""This is text scraped from the careers/jobs page of "{company_name}".
+
+Extract any ENGINEERING job openings mentioned (software, backend, frontend, data, ML, DevOps, SRE, QA, mobile, infra, security engineering roles). Ignore non-engineering roles.
+
+For each one, note if the text suggests it's remote, hybrid, onsite, or unclear.
+
+Page text:
+---
+{page_text}
+---
+
+Respond with ONLY a JSON array, no preamble, no markdown fences. Each item:
+{{"title": "...", "remote_hint": "remote" | "hybrid" | "onsite" | "unclear"}}
+
+If no engineering roles are found, respond with an empty array: []"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": CLAUDE_MODEL, "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        text = text.strip().strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+        parsed = json.loads(text)
+        out = []
+        for item in parsed:
+            hint = item.get("remote_hint", "unclear")
+            remote_flag = True if hint == "remote" else (False if hint in ("hybrid", "onsite") else None)
+            out.append({
+                "title": item.get("title", ""),
+                "location": hint,
+                "remote": remote_flag,
+                "description": "",  # no structured description available from this path
+            })
+        return out
+    except Exception:
+        return []
 
 
-def filter_engineering(titles):
-    return [t for t in titles if any(kw in t.lower() for kw in ENGINEERING_KEYWORDS)]
+# ----------------------------------------------------------------------------
+# Website tech fingerprint (free — homepage signature scan)
+# ----------------------------------------------------------------------------
+
+def website_signals(domain):
+    host = clean_domain(domain)
+    if not host:
+        return ""
+    for scheme in ("https://", "http://"):
+        try:
+            r = requests.get(f"{scheme}{host}", timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                haystack = r.text.lower() + " ".join(f"{k}:{v}" for k, v in r.headers.items()).lower()
+                found = [name for name, markers in WEBSITE_SIGNATURES.items()
+                         if any(m.lower() in haystack for m in markers)]
+                return ", ".join(found) if found else "no signals detected"
+        except requests.RequestException:
+            continue
+    return ""
 
 
 # ----------------------------------------------------------------------------
@@ -209,13 +429,21 @@ def try_github_languages(company_name, domain):
 # Claude classification
 # ----------------------------------------------------------------------------
 
-def classify_with_claude(api_key, company_name, domain, eng_titles, github_langs):
+def classify_with_claude(api_key, company_name, domain, eng_jobs, website_sig, github_langs):
+    job_block = "\n".join(
+        f"- {j['title']} ({j.get('location') or 'location unknown'}): {j.get('description') or 'no description available'}"
+        for j in eng_jobs
+    ) or "none found"
+
     prompt = f"""You are helping a technical recruiting company assess an engineering team.
 
 Company: {company_name}
 Domain: {domain}
-Open engineering job titles found (may be empty): {json.dumps(eng_titles)}
-GitHub languages detected (may be empty or "unknown"): {github_langs or "unknown"}
+Open engineering roles found:
+{job_block}
+
+Website frontend/infra signals detected (may be empty or 'unknown'): {website_sig or "unknown"}
+GitHub languages detected (may be empty or 'unknown'): {github_langs or "unknown"}
 
 Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no markdown fences:
 {{
@@ -229,16 +457,8 @@ Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no ma
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CLAUDE_MODEL,
-                "max_tokens": 400,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": CLAUDE_MODEL, "max_tokens": 400, "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
         if r.status_code != 200:
@@ -247,7 +467,7 @@ Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no ma
         data = r.json()
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         text = text.strip().strip("`")
-        if text.startswith("json"):
+        if text.lower().startswith("json"):
             text = text[4:].strip()
         parsed = json.loads(text)
         return {
@@ -268,10 +488,9 @@ Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no ma
 
 st.title("🛠️ Futura — Engineering Enrichment")
 st.caption(
-    "Upload your Airscale/Clay CSV. This tool checks each company's own careers page "
-    "(Greenhouse / Lever / Ashby — not LinkedIn Jobs) for open engineering roles, "
-    "optionally checks public GitHub, and can classify tech stack, engineer types, "
-    "and seniority mix with Claude."
+    "Upload your Airscale/Clay CSV. Checks Greenhouse / Lever / Ashby for open engineering roles, "
+    "falls back to reading the careers page with Claude if none of those match, and can classify "
+    "tech stack, engineer types, and seniority mix."
 )
 
 api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
@@ -279,12 +498,19 @@ api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 with st.sidebar:
     st.header("Settings")
     do_classify = st.toggle(
-        "Classify with Claude (costs ~$0.01–0.02/company)",
+        "Classify with Claude (costs ~$0.01–0.03/company)",
         value=False,
-        help="Turn off to run a free coverage test (just ATS + GitHub lookups).",
+        help="Also enables the careers-page fallback for companies with no ATS match.",
     )
     if do_classify and not api_key:
-        st.error("No ANTHROPIC_API_KEY found in app secrets. Ask an admin to add it before enabling classification.")
+        st.error("No ANTHROPIC_API_KEY found in app secrets. Ask an admin to add it before enabling this.")
+    remote_only = st.toggle(
+        "Only count remote roles",
+        value=False,
+        help="Filters to roles explicitly marked remote. Roles with unknown remote status are excluded when this is on.",
+    )
+    check_website = st.toggle("Fingerprint homepage (free)", value=True,
+                               help="Scans the homepage HTML for frontend/infra signatures like React, WordPress, Shopify, etc.")
     check_github = st.toggle("Also check public GitHub languages", value=False,
                               help="Free, but GitHub allows only ~60 unauthenticated requests/hour.")
     max_companies = st.number_input("Max companies to process (0 = all)", min_value=0, value=10, step=5)
@@ -328,25 +554,36 @@ if uploaded is not None:
             domain = str(row.get(domain_col, "") or "")
             status.text(f"Processing {i + 1}/{n}: {company_name or domain}")
 
-            ats_name, titles = detect_ats_jobs(company_name, domain)
-            eng_titles = filter_engineering(titles)
+            ats_name, jobs = detect_ats_jobs(company_name, domain)
+            source = ats_name
 
-            github_langs = None
-            if check_github:
-                github_langs = try_github_languages(company_name, domain)
+            if not jobs and do_classify and api_key:
+                careers_url = find_careers_url(domain)
+                if careers_url:
+                    page_text = fetch_page_text(careers_url)
+                    if page_text:
+                        jobs = claude_extract_jobs_from_page(api_key, company_name, page_text)
+                        if jobs:
+                            source = "Careers page (Claude)"
+
+            eng_jobs = filter_engineering(jobs)
+            eng_jobs = filter_remote(eng_jobs, remote_only)
+
+            website_sig = website_signals(domain) if check_website else ""
+            github_langs = try_github_languages(company_name, domain) if check_github else None
 
             row_result = {
-                "ats_source": ats_name or "",
-                "open_engineering_jobs": len(eng_titles),
-                "engineering_job_titles": "; ".join(eng_titles[:10]),
+                "ats_source": source or "",
+                "open_engineering_jobs": len(eng_jobs),
+                "engineering_job_titles": "; ".join(j["title"] for j in eng_jobs[:10]),
+                "website_signals": website_sig,
                 "github_languages": github_langs or "",
             }
 
             if do_classify and api_key:
                 row_result.update(
-                    classify_with_claude(api_key, company_name, domain, eng_titles, github_langs)
+                    classify_with_claude(api_key, company_name, domain, eng_jobs, website_sig, github_langs)
                 )
-                time.sleep(0.2)  # gentle pacing
 
             results.append(row_result)
             progress.progress((i + 1) / n)
@@ -354,7 +591,6 @@ if uploaded is not None:
         status.text("Done.")
 
         results_df = pd.DataFrame(results)
-        # pad remaining rows (if max_companies < len(df)) with blanks so columns still align
         if n < len(work_df):
             pad = pd.DataFrame([{} for _ in range(len(work_df) - n)])
             results_df = pd.concat([results_df, pad], ignore_index=True)
