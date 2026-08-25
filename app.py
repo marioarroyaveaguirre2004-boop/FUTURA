@@ -196,7 +196,7 @@ def looks_remote(location_text, remote_flag=None):
 def call_apify_ats_jobs(apify_token, domain):
     host = clean_domain(domain)
     if not host:
-        return None
+        return None, "no valid domain"
 
     payload = {
         "companies_include": [host],
@@ -213,12 +213,17 @@ def call_apify_ats_jobs(apify_token, domain):
             timeout=APIFY_TIMEOUT,
         )
         if r.status_code != 200:
-            return None
+            # Surface the real reason instead of failing silently — e.g. 401
+            # (bad token), 404 (wrong actor id), 402 (out of platform credit).
+            snippet = r.text[:200] if r.text else ""
+            return None, f"HTTP {r.status_code}: {snippet}"
         items = r.json()
         if not isinstance(items, list):
-            return None
-    except (requests.RequestException, ValueError):
-        return None
+            return None, "unexpected response shape (not a list)"
+    except requests.RequestException as e:
+        return None, f"request failed: {e}"
+    except ValueError as e:
+        return None, f"bad JSON response: {e}"
 
     out = []
     for j in items:
@@ -241,15 +246,17 @@ def call_apify_ats_jobs(apify_token, domain):
             "remote": looks_remote(loc_text, remote_flag),
             "description": html_to_text(desc, MAX_DESC_CHARS_PER_JOB) if "<" in desc else desc[:MAX_DESC_CHARS_PER_JOB],
         })
-    return out
+    return out, None
 
 
 def detect_ats_jobs(apify_token, domain):
     """Single entry point for the ATS lookup step. Returns (source_name, [normalized jobs])."""
-    jobs = call_apify_ats_jobs(apify_token, domain)
+    jobs, error = call_apify_ats_jobs(apify_token, domain)
+    if error:
+        return f"Apify error: {error}", []
     if jobs:
         return "Apify (ATS Jobs API)", jobs
-    return None, []
+    return "Apify (0 jobs found)", []
 
 
 def filter_engineering(jobs):
