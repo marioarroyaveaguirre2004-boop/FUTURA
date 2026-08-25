@@ -212,7 +212,7 @@ def call_apify_ats_jobs(apify_token, domain):
             json=payload,
             timeout=APIFY_TIMEOUT,
         )
-        if r.status_code != 200:
+        if not (200 <= r.status_code < 300):
             # Surface the real reason instead of failing silently — e.g. 401
             # (bad token), 404 (wrong actor id), 402 (out of platform credit).
             snippet = r.text[:200] if r.text else ""
