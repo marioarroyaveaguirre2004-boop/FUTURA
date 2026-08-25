@@ -3,11 +3,13 @@ Futura Work — Engineering Enrichment Tool
 Upload an Airscale/Clay CSV, get engineering hiring signal + tech stack enrichment back.
 
 Search order for open engineering jobs:
-  1. Greenhouse (free API)
-  2. Lever (free API)
-  3. Ashby (free API)
-  4. Careers page read by Claude (fallback, only runs when classification is enabled,
-     since it requires Claude to interpret unstructured text)
+  1. Apify — Jobo "ATS Jobs API" actor (queries 75+ ATS platforms: Greenhouse, Lever,
+     Ashby, Workday, iCIMS, Taleo, SuccessFactors, and more, via one call, matched by
+     company domain)
+  2. Careers page read by Claude (fallback, only runs when classification is enabled,
+     since it requires Claude to interpret unstructured text) — catches companies that
+     post jobs on their own site without any ATS behind it (common for small biotech,
+     academic/nonprofit orgs, etc.)
 
 Adds new columns without touching any existing columns.
 """
@@ -31,6 +33,11 @@ PAGE_FETCH_TIMEOUT = 10
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_DESC_CHARS_PER_JOB = 700       # per-job description truncation fed to Claude
 MAX_PAGE_CHARS_FOR_FALLBACK = 6000  # careers-page text truncation fed to Claude
+
+# Apify — Jobo "ATS Jobs API" actor
+APIFY_ACTOR_ID = "jobo.world~ats-jobs-api"
+APIFY_RUN_SYNC_URL = f"https://api.apify.com/v2/actors/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
+APIFY_TIMEOUT = 60  # this actor is typically fast (single-company lookups), but give it room
 
 ENGINEERING_KEYWORDS = [
     "engineer", "engineering", "developer", "dev ", "swe", "software",
@@ -179,96 +186,69 @@ def looks_remote(location_text, remote_flag=None):
 
 
 # ----------------------------------------------------------------------------
-# ATS lookups (free, no auth) — return normalized job dicts
+# ATS lookup via Apify — Jobo "ATS Jobs API"
+# Replaces the previous direct Greenhouse/Lever/Ashby probing. Matches by
+# company domain (more reliable than name, since indexed company names don't
+# always match your CSV's spelling — e.g. "BOI" vs "BOI (Board of Innovation)").
 # normalized job = {"title", "location", "remote" (True/False/None), "description"}
 # ----------------------------------------------------------------------------
 
-def try_greenhouse(slug):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+def call_apify_ats_jobs(apify_token, domain):
+    host = clean_domain(domain)
+    if not host:
+        return None
+
+    payload = {
+        "companies_include": [host],
+        "queries": [],       # empty = don't filter by title, get everything for this company
+        "sources": [],       # empty = search across all supported ATS platforms
+        "page_size": 100,
+    }
+
     try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r = requests.post(
+            APIFY_RUN_SYNC_URL,
+            params={"token": apify_token},
+            json=payload,
+            timeout=APIFY_TIMEOUT,
+        )
         if r.status_code != 200:
             return None
-        data = r.json()
-        jobs = data.get("jobs", [])
-        if not isinstance(jobs, list):
+        items = r.json()
+        if not isinstance(items, list):
             return None
-        out = []
-        for j in jobs:
-            loc = (j.get("location") or {}).get("name", "")
-            desc = html_to_text(j.get("content", ""), MAX_DESC_CHARS_PER_JOB)
-            out.append({
-                "title": j.get("title", ""),
-                "location": loc,
-                "remote": looks_remote(loc),
-                "description": desc,
-            })
-        return out
     except (requests.RequestException, ValueError):
         return None
 
-
-def try_lever(slug):
-    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, list):
-            return None
-        out = []
-        for j in data:
-            categories = j.get("categories", {}) or {}
-            loc = categories.get("location", "") or ""
-            workplace_type = j.get("workplaceType")  # "remote"/"hybrid"/"onsite" on newer Lever boards
-            remote_flag = True if workplace_type == "remote" else (False if workplace_type in ("hybrid", "onsite") else None)
-            desc = j.get("descriptionPlain") or html_to_text(j.get("description", ""), MAX_DESC_CHARS_PER_JOB)
-            out.append({
-                "title": j.get("text", ""),
-                "location": loc,
-                "remote": looks_remote(loc, remote_flag),
-                "description": (desc or "")[:MAX_DESC_CHARS_PER_JOB],
-            })
-        return out
-    except (requests.RequestException, ValueError):
-        return None
+    out = []
+    for j in items:
+        # Field names per Jobo's documented schema (Title, Company, Workplace,
+        # Locations, Description, Role summary...). If Apify ever renames a
+        # field, these .get() fallbacks keep this from silently breaking —
+        # but double check against a real dataset export if results look thin.
+        title = j.get("title", "") or ""
+        workplace = j.get("workplace") or j.get("work_model")  # e.g. "remote"/"hybrid"/"onsite"
+        locations = j.get("locations")
+        if isinstance(locations, list):
+            loc_text = ", ".join(str(l) for l in locations)
+        else:
+            loc_text = str(locations or "")
+        remote_flag = True if workplace == "remote" else (False if workplace in ("hybrid", "onsite") else None)
+        desc = j.get("description") or j.get("summary") or ""
+        out.append({
+            "title": title,
+            "location": loc_text,
+            "remote": looks_remote(loc_text, remote_flag),
+            "description": html_to_text(desc, MAX_DESC_CHARS_PER_JOB) if "<" in desc else desc[:MAX_DESC_CHARS_PER_JOB],
+        })
+    return out
 
 
-def try_ashby(slug):
-    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        jobs = data.get("jobs", [])
-        if not isinstance(jobs, list):
-            return None
-        out = []
-        for j in jobs:
-            loc = j.get("location", "") or ""
-            remote_flag = j.get("isRemote")
-            desc = html_to_text(j.get("descriptionHtml", ""), MAX_DESC_CHARS_PER_JOB)
-            out.append({
-                "title": j.get("title", ""),
-                "location": loc,
-                "remote": looks_remote(loc, remote_flag),
-                "description": desc,
-            })
-        return out
-    except (requests.RequestException, ValueError):
-        return None
-
-
-def detect_ats_jobs(company_name, domain):
-    """Try every candidate slug against every ATS. Return (ats_name, [normalized jobs])."""
-    slugs = candidate_slugs(company_name, domain)
-    for slug in slugs:
-        for ats_name, fn in [("Greenhouse", try_greenhouse), ("Lever", try_lever), ("Ashby", try_ashby)]:
-            jobs = fn(slug)
-            if jobs is not None:
-                return ats_name, jobs
+def detect_ats_jobs(apify_token, domain):
+    """Single entry point for the ATS lookup step. Returns (source_name, [normalized jobs])."""
+    jobs = call_apify_ats_jobs(apify_token, domain)
+    if jobs:
+        return "Apify (ATS Jobs API)", jobs
     return None, []
 
 
@@ -488,15 +468,18 @@ Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no ma
 
 st.title("🛠️ Futura — Engineering Enrichment")
 st.caption(
-    "Upload your Airscale/Clay CSV. Checks Greenhouse / Lever / Ashby for open engineering roles, "
-    "falls back to reading the careers page with Claude if none of those match, and can classify "
-    "tech stack, engineer types, and seniority mix."
+    "Upload your Airscale/Clay CSV. Checks 75+ ATS platforms (via Apify/Jobo) for open "
+    "engineering roles, falls back to reading the careers page with Claude if none of "
+    "those match, and can classify tech stack, engineer types, and seniority mix."
 )
 
 api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+apify_token = st.secrets.get("APIFY_API_TOKEN", "")
 
 with st.sidebar:
     st.header("Settings")
+    if not apify_token:
+        st.error("No APIFY_API_TOKEN found in app secrets. Ask an admin to add it before running.")
     do_classify = st.toggle(
         "Classify with Claude (costs ~$0.01–0.03/company)",
         value=False,
@@ -538,7 +521,7 @@ if uploaded is not None:
         domain_col = st.selectbox("Company domain column", options=cols,
                                    index=cols.index(guessed_domain_col) if guessed_domain_col in cols else 0)
 
-    run = st.button("Run enrichment", type="primary")
+    run = st.button("Run enrichment", type="primary", disabled=not apify_token)
 
     if run:
         work_df = df.copy()
@@ -554,7 +537,7 @@ if uploaded is not None:
             domain = str(row.get(domain_col, "") or "")
             status.text(f"Processing {i + 1}/{n}: {company_name or domain}")
 
-            ats_name, jobs = detect_ats_jobs(company_name, domain)
+            ats_name, jobs = detect_ats_jobs(apify_token, domain)
             source = ats_name
 
             if not jobs and do_classify and api_key:
