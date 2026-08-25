@@ -35,7 +35,7 @@ MAX_DESC_CHARS_PER_JOB = 700       # per-job description truncation fed to Claud
 MAX_PAGE_CHARS_FOR_FALLBACK = 6000  # careers-page text truncation fed to Claude
 
 # Apify — Jobo "ATS Jobs API" actor
-APIFY_ACTOR_ID = "jobo.world~ats-jobs-api"
+APIFY_ACTOR_ID = "NDli5o5pYKW1atJAY"
 APIFY_RUN_SYNC_URL = f"https://api.apify.com/v2/actors/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
 APIFY_TIMEOUT = 60  # this actor is typically fast (single-company lookups), but give it room
 
