@@ -3,9 +3,9 @@ Futura Work — Engineering Enrichment Tool
 Upload an Airscale/Clay CSV, get engineering hiring signal + tech stack enrichment back.
 
 Search order for open engineering jobs:
-  1. Apify — Jobo "ATS Jobs API" actor (queries 75+ ATS platforms: Greenhouse, Lever,
-     Ashby, Workday, iCIMS, Taleo, SuccessFactors, and more, via one call, matched by
-     company domain)
+  1. Jobo Feed & Search API, called directly (connect.jobo.world) — queries 150+ ATS
+     platforms (Greenhouse, Lever, Ashby, Workday, iCIMS, Taleo, SuccessFactors, and
+     more) in one call, matched by company domain
   2. Careers page read by Claude (fallback, only runs when classification is enabled,
      since it requires Claude to interpret unstructured text) — catches companies that
      post jobs on their own site without any ATS behind it (common for small biotech,
@@ -34,10 +34,9 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_DESC_CHARS_PER_JOB = 700       # per-job description truncation fed to Claude
 MAX_PAGE_CHARS_FOR_FALLBACK = 6000  # careers-page text truncation fed to Claude
 
-# Apify — Jobo "ATS Jobs API" actor
-APIFY_ACTOR_ID = "NDli5o5pYKW1atJAY"
-APIFY_RUN_SYNC_URL = f"https://api.apify.com/v2/actors/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
-APIFY_TIMEOUT = 60  # this actor is typically fast (single-company lookups), but give it room
+# Jobo — Feed & Search API, called directly (no Apify in between)
+JOBO_SEARCH_URL = "https://connect.jobo.world/api/jobs/search"
+JOBO_TIMEOUT = 30
 
 ENGINEERING_KEYWORDS = [
     "engineer", "engineering", "developer", "dev ", "swe", "software",
@@ -186,40 +185,40 @@ def looks_remote(location_text, remote_flag=None):
 
 
 # ----------------------------------------------------------------------------
-# ATS lookup via Apify — Jobo "ATS Jobs API"
-# Replaces the previous direct Greenhouse/Lever/Ashby probing. Matches by
-# company domain (more reliable than name, since indexed company names don't
-# always match your CSV's spelling — e.g. "BOI" vs "BOI (Board of Innovation)").
+# ATS lookup via Jobo Feed & Search API — called directly (connect.jobo.world)
+# Matches by company domain (more reliable than name, since indexed company
+# names don't always match your CSV's spelling — e.g. "BOI" vs
+# "BOI (Board of Innovation)").
 # normalized job = {"title", "location", "remote" (True/False/None), "description"}
 # ----------------------------------------------------------------------------
 
-def call_apify_ats_jobs(apify_token, domain):
+def call_jobo_api(jobo_key, domain):
     host = clean_domain(domain)
     if not host:
         return None, "no valid domain"
 
     payload = {
-        "companies_include": [host],
-        "queries": [],       # empty = don't filter by title, get everything for this company
-        "sources": [],       # empty = search across all supported ATS platforms
+        "companies": {"include": [host]},
+        "queries": [],  # empty = don't filter by title, get everything for this company
         "page_size": 100,
     }
 
     try:
         r = requests.post(
-            APIFY_RUN_SYNC_URL,
-            params={"token": apify_token},
+            JOBO_SEARCH_URL,
+            headers={"X-Api-Key": jobo_key, "Content-Type": "application/json"},
             json=payload,
-            timeout=APIFY_TIMEOUT,
+            timeout=JOBO_TIMEOUT,
         )
         if not (200 <= r.status_code < 300):
             # Surface the real reason instead of failing silently — e.g. 401
-            # (bad token), 404 (wrong actor id), 402 (out of platform credit).
+            # (bad key), 402/429 (out of balance / rate limited).
             snippet = r.text[:200] if r.text else ""
             return None, f"HTTP {r.status_code}: {snippet}"
-        items = r.json()
+        data = r.json()
+        items = data.get("jobs", [])
         if not isinstance(items, list):
-            return None, "unexpected response shape (not a list)"
+            return None, "unexpected response shape (no 'jobs' list)"
     except requests.RequestException as e:
         return None, f"request failed: {e}"
     except ValueError as e:
@@ -227,18 +226,20 @@ def call_apify_ats_jobs(apify_token, domain):
 
     out = []
     for j in items:
-        # Field names per Jobo's documented schema (Title, Company, Workplace,
-        # Locations, Description, Role summary...). If Apify ever renames a
-        # field, these .get() fallbacks keep this from silently breaking —
-        # but double check against a real dataset export if results look thin.
+        # Field names per Jobo's official Feed & Search API schema.
         title = j.get("title", "") or ""
-        workplace = j.get("workplace") or j.get("work_model")  # e.g. "remote"/"hybrid"/"onsite"
         locations = j.get("locations")
         if isinstance(locations, list):
-            loc_text = ", ".join(str(l) for l in locations)
+            loc_text = ", ".join(
+                ", ".join(filter(None, [loc.get("city"), loc.get("region"), loc.get("country")]))
+                for loc in locations if isinstance(loc, dict)
+            )
         else:
             loc_text = str(locations or "")
-        remote_flag = True if workplace == "remote" else (False if workplace in ("hybrid", "onsite") else None)
+        workplace = j.get("workplace_type")  # "remote" / "hybrid" / "onsite"
+        remote_flag = j.get("is_remote")
+        if remote_flag is None:
+            remote_flag = True if workplace == "remote" else (False if workplace in ("hybrid", "onsite") else None)
         desc = j.get("description") or j.get("summary") or ""
         out.append({
             "title": title,
@@ -249,14 +250,14 @@ def call_apify_ats_jobs(apify_token, domain):
     return out, None
 
 
-def detect_ats_jobs(apify_token, domain):
+def detect_ats_jobs(jobo_key, domain):
     """Single entry point for the ATS lookup step. Returns (source_name, [normalized jobs])."""
-    jobs, error = call_apify_ats_jobs(apify_token, domain)
+    jobs, error = call_jobo_api(jobo_key, domain)
     if error:
-        return f"Apify error: {error}", []
+        return f"Jobo error: {error}", []
     if jobs:
-        return "Apify (ATS Jobs API)", jobs
-    return "Apify (0 jobs found)", []
+        return "Jobo (ATS Jobs API)", jobs
+    return "Jobo (0 jobs found)", []
 
 
 def filter_engineering(jobs):
@@ -475,18 +476,18 @@ Based ONLY on this evidence, respond with ONLY a JSON object, no preamble, no ma
 
 st.title("🛠️ Futura — Engineering Enrichment")
 st.caption(
-    "Upload your Airscale/Clay CSV. Checks 75+ ATS platforms (via Apify/Jobo) for open "
+    "Upload your Airscale/Clay CSV. Checks 150+ ATS platforms (via Jobo) for open "
     "engineering roles, falls back to reading the careers page with Claude if none of "
     "those match, and can classify tech stack, engineer types, and seniority mix."
 )
 
 api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-apify_token = st.secrets.get("APIFY_API_TOKEN", "")
+jobo_key = st.secrets.get("JOBO_API_KEY", "")
 
 with st.sidebar:
     st.header("Settings")
-    if not apify_token:
-        st.error("No APIFY_API_TOKEN found in app secrets. Ask an admin to add it before running.")
+    if not jobo_key:
+        st.error("No JOBO_API_KEY found in app secrets. Ask an admin to add it before running.")
     do_classify = st.toggle(
         "Classify with Claude (costs ~$0.01–0.03/company)",
         value=False,
@@ -528,7 +529,7 @@ if uploaded is not None:
         domain_col = st.selectbox("Company domain column", options=cols,
                                    index=cols.index(guessed_domain_col) if guessed_domain_col in cols else 0)
 
-    run = st.button("Run enrichment", type="primary", disabled=not apify_token)
+    run = st.button("Run enrichment", type="primary", disabled=not jobo_key)
 
     if run:
         work_df = df.copy()
@@ -544,7 +545,7 @@ if uploaded is not None:
             domain = str(row.get(domain_col, "") or "")
             status.text(f"Processing {i + 1}/{n}: {company_name or domain}")
 
-            ats_name, jobs = detect_ats_jobs(apify_token, domain)
+            ats_name, jobs = detect_ats_jobs(jobo_key, domain)
             source = ats_name
 
             if not jobs and do_classify and api_key:
