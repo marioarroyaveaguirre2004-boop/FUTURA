@@ -199,7 +199,11 @@ def call_jobo_api(jobo_key, domain):
 
     payload = {
         "companies": {"include": [host]},
-        "queries": [],  # empty = don't filter by title, get everything for this company
+        # Jobo's `queries` combines up to 5 terms with OR. Filtering here (not
+        # just client-side after) matters for companies with lots of postings
+        # across many departments — otherwise engineering roles can fall
+        # outside the first page_size results if they're not sorted first.
+        "queries": ["engineer", "developer", "software", "devops", "data"],
         "page_size": 100,
     }
 
